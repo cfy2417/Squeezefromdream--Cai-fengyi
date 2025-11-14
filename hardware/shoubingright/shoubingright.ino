@@ -1,0 +1,296 @@
+// ✨ 关键：禁用brownout检测 ✨
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <OSCMessage.h>
+
+// WiFi 配置
+const char* ssid = "Qifei";
+const char* password = "88888888";
+const char* ueHost = "172.20.10.14"; // UE5 OSC 监听 IP
+const int uePort = 7654;
+const int listenPort = 8888; // 监听ESP32S3数据的端口
+
+// 硬件引脚定义
+const int joyXPin = 34;
+const int joyYPin = 35;
+const int pressure2Pin = 33;
+const int button4Pin = 14;
+
+WiFiUDP udpSend;
+WiFiUDP udpReceive;
+
+// 按钮状态跟踪
+bool button4State = false, button4LastState = false;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// ESP32S3数据包结构
+struct SensorDataPacket {
+    char header[4];
+    float accelX, accelY, accelZ;
+    float gyroX, gyroY, gyroZ;
+    float pressure1;
+    uint8_t buttons;
+    uint8_t checksum;
+} __attribute__((packed));
+
+SensorDataPacket s3Data = {0};
+bool s3DataValid = false;
+unsigned long lastS3DataTime = 0;
+const unsigned long s3Timeout = 200;
+
+// WiFi重连管理
+unsigned long lastWiFiCheck = 0;
+const unsigned long wifiCheckInterval = 5000; // 每5秒检查一次WiFi
+
+void setup() {
+    // ✨✨✨ 关键第一步：禁用brownout检测 ✨✨✨
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    
+    // ✨✨✨ 关键第二步：长延迟让电源完全稳定 ✨✨✨
+    delay(5000); // 5秒延迟
+    
+    // ✨✨✨ 串口初始化但不等待 ✨✨✨
+    Serial.begin(115200);
+    delay(100); // 短暂延迟让串口初始化
+    // 不等待Serial连接，直接继续
+    
+    Serial.println("\n\n=== ESP32 Starting ===");
+    
+    // 初始化按钮引脚
+    pinMode(button4Pin, INPUT_PULLUP);
+    
+    // ✨✨✨ WiFi初始化 ✨✨✨
+    connectWiFi();
+    
+    // 开始监听UDP端口
+    if (WiFi.status() == WL_CONNECTED) {
+        udpReceive.begin(listenPort);
+        Serial.print("Listening on port ");
+        Serial.println(listenPort);
+    }
+}
+
+void loop() {
+    // ✨✨✨ 定期检查WiFi连接状态 ✨✨✨
+    if (millis() - lastWiFiCheck > wifiCheckInterval) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected! Reconnecting...");
+            connectWiFi();
+        }
+    }
+    
+    // 只在WiFi连接时执行主要功能
+    if (WiFi.status() != WL_CONNECTED) {
+        delay(100);
+        return;
+    }
+    
+    // ========== 接收ESP32S3数据 ==========
+    receiveS3Data();
+    
+    // ========== 读取摇杆数据 ==========
+    int joyX = analogRead(joyXPin);
+    int joyY = analogRead(joyYPin);
+    
+    float normalizedX = (joyX - 2048.0) / 2048.0;
+    float normalizedY = (joyY - 2048.0) / 2048.0;
+    normalizedX = constrain(normalizedX, -1.0, 1.0);
+    normalizedY = constrain(normalizedY, -1.0, 1.0);
+    
+    sendOSCFloat("/avatar/input/joystick/x", normalizedX);
+    sendOSCFloat("/avatar/input/joystick/y", normalizedY);
+    
+    // ========== 读取压力传感器数据 ==========
+    int pressure2Raw = analogRead(pressure2Pin);
+    float pressure2 = pressure2Raw / 4095.0;
+    pressure2 = constrain(pressure2, 0.0, 1.0);
+    
+    sendOSCFloat("/avatar/input/pressure/2", pressure2);
+    
+    // ========== 发送ESP32S3的数据 ==========
+    if (s3DataValid && (millis() - lastS3DataTime < s3Timeout)) {
+        sendOSCFloat("/avatar/input/accel/x", s3Data.accelX);
+        sendOSCFloat("/avatar/input/accel/y", s3Data.accelY);
+        sendOSCFloat("/avatar/input/accel/z", s3Data.accelZ);
+        
+        sendOSCFloat("/avatar/input/gyro/x", s3Data.gyroX);
+        sendOSCFloat("/avatar/input/gyro/y", s3Data.gyroY);
+        sendOSCFloat("/avatar/input/gyro/z", s3Data.gyroZ);
+        
+        sendOSCFloat("/avatar/input/pressure/1", s3Data.pressure1);
+        
+        bool button1 = s3Data.buttons & 0x01;
+        bool button2 = s3Data.buttons & 0x02;
+        bool button3 = s3Data.buttons & 0x04;
+        
+        sendOSCBool("/avatar/input/button/1", button1);
+        sendOSCBool("/avatar/input/button/2", button2);
+        sendOSCBool("/avatar/input/button/3", button3);
+    }
+    
+    // ========== 读取本地按钮4 ==========
+    readAndSendButton(button4Pin, "/avatar/input/button/4", button4State, button4LastState);
+    
+    // 调试打印
+    Serial.print("Joystick X=");
+    Serial.print(normalizedX, 2);
+    Serial.print(" Y=");
+    Serial.print(normalizedY, 2);
+    
+    if (s3DataValid && (millis() - lastS3DataTime < s3Timeout)) {
+        Serial.print(" | Pressure1=");
+        Serial.print(s3Data.pressure1, 2);
+        Serial.print(" Pressure2=");
+        Serial.print(pressure2, 2);
+        Serial.print(" | Accel X=");
+        Serial.print(s3Data.accelX, 2);
+        Serial.print(" Y=");
+        Serial.print(s3Data.accelY, 2);
+        Serial.print(" Z=");
+        Serial.print(s3Data.accelZ, 2);
+        Serial.print(" | Gyro X=");
+        Serial.print(s3Data.gyroX, 1);
+        Serial.print(" Y=");
+        Serial.print(s3Data.gyroY, 1);
+        Serial.print(" Z=");
+        Serial.print(s3Data.gyroZ, 1);
+        Serial.print(" | Buttons: ");
+        Serial.print((s3Data.buttons & 0x01) ? 1 : 0);
+        Serial.print((s3Data.buttons & 0x02) ? 1 : 0);
+        Serial.print((s3Data.buttons & 0x04) ? 1 : 0);
+    } else {
+        Serial.print(" | Pressure1=0.00 Pressure2=");
+        Serial.print(pressure2, 2);
+        Serial.print(" | [S3_OFFLINE] | Buttons: 000");
+    }
+    
+    Serial.println(button4State);
+    
+    delay(20);
+}
+
+// ✨✨✨ WiFi连接函数（独立封装）✨✨✨
+void connectWiFi() {
+    Serial.println("Initializing WiFi...");
+    
+    // 完全重置WiFi
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    delay(500);
+    
+    // 禁用省电模式
+    WiFi.setSleep(false);
+    
+    // 设置自动重连
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false); // ✨ 改为false，不保存WiFi配置到flash
+    
+    Serial.print("Connecting to: ");
+    Serial.println(ssid);
+    
+    WiFi.begin(ssid, password);
+    
+    // 等待连接，最多30秒
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+        
+        if (attempts % 10 == 0) {
+            Serial.println();
+            Serial.print("Status: ");
+            Serial.print(WiFi.status());
+            Serial.print(" | Attempts: ");
+            Serial.println(attempts);
+        }
+    }
+    
+    Serial.println();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("✓ WiFi Connected!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+    } else {
+        Serial.println("✗ WiFi Failed!");
+        Serial.print("Final Status: ");
+        Serial.println(WiFi.status());
+        Serial.println("Restarting in 5s...");
+        delay(5000);
+        ESP.restart();
+    }
+}
+
+void receiveS3Data() {
+    int packetSize = udpReceive.parsePacket();
+    if (packetSize == sizeof(SensorDataPacket)) {
+        SensorDataPacket tempData;
+        udpReceive.read((uint8_t*)&tempData, sizeof(SensorDataPacket));
+        
+        if (tempData.header[0] == 'S' && tempData.header[1] == '3' && 
+            tempData.header[2] == 'D' && tempData.header[3] == 'T') {
+            
+            uint8_t calculatedChecksum = calculateChecksum((uint8_t*)&tempData, sizeof(SensorDataPacket) - 1);
+            if (calculatedChecksum == tempData.checksum) {
+                s3Data = tempData;
+                s3DataValid = true;
+                lastS3DataTime = millis();
+            } else {
+                Serial.println("Checksum error!");
+            }
+        }
+    }
+}
+
+void sendOSCFloat(const char* address, float value) {
+    OSCMessage msg(address);
+    msg.add(value);
+    udpSend.beginPacket(ueHost, uePort);
+    msg.send(udpSend);
+    udpSend.endPacket();
+}
+
+void sendOSCBool(const char* address, bool value) {
+    OSCMessage msg(address);
+    msg.add((int32_t)(value ? 1 : 0));
+    udpSend.beginPacket(ueHost, uePort);
+    msg.send(udpSend);
+    udpSend.endPacket();
+}
+
+void readAndSendButton(int pin, const char* address, bool &currentState, bool &lastState) {
+    bool reading = !digitalRead(pin);
+    
+    if (reading != lastState) {
+        lastDebounceTime = millis();
+    }
+    
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+        if (reading != currentState) {
+            currentState = reading;
+            sendOSCBool(address, currentState);
+        }
+    }
+    
+    lastState = reading;
+}
+
+uint8_t calculateChecksum(uint8_t* data, size_t length) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < length; i++) {
+        sum ^= data[i];
+    }
+    return sum;
+}
